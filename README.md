@@ -1,79 +1,102 @@
-# Slack Bot using Google Agent Development Kit (Python, Cloud Run)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/danishi/slack-bot-adk-python-cloudrun)
-![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)
+# Salesforce Agent — Slack Bot (ADK + MCP, Cloud Run)
 
-<img width="1024" alt="image" src="https://github.com/user-attachments/assets/815339c0-5299-498e-8372-d03acc442830" />
+A Slack Bot that lets you interact with Salesforce data using natural language. Built with [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/) and [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), powered by [Vertex AI Gemini](https://cloud.google.com/vertex-ai), and deployed on [Cloud Run](https://cloud.google.com/run).
 
-This repository provides a Slack bot backend implemented in Python that uses [Slack Bolt](https://slack.dev/bolt-python) and Google Cloud's [Vertex AI Gemini](https://cloud.google.com/vertex-ai) model via the [Agent Development Kit](https://google.github.io/adk-docs/). The bot responds to text, images, PDFs, plain text files, videos, and audio messages, while maintaining conversation context within Slack threads. It is designed to run on [Cloud Run](https://cloud.google.com/run).
-
-If you want to use the [Google Gen AI SDK](https://googleapis.github.io/python-genai/), please refer to [this repository](https://github.com/danishi/slack-gemini-bot-on-google-cloud)💡
-
-If you want a simpler, lightweight Slack bot without the ADK framework, check out [Nano Banana](https://github.com/danishi/slack-nano-banana-bot-on-google-cloud)🍌
+Based on [slack-bot-adk-python-cloudrun](https://github.com/danishi/slack-bot-adk-python-cloudrun).
 
 ## Features
-- Responds to `@mention` messages in Slack channels.
-- Supports text, image, PDF, text file, video, and audio inputs from Slack messages. Files are fetched via authenticated URLs and sent to Gemini for multimodal understanding.
-- Maintains conversation context by retrieving prior messages in a thread and sending them as conversation history to Gemini.
-- Formats responses using Slack-compatible Markdown for rich text output.
-- FastAPI-based web server suitable for Cloud Run.
-- Deployment script for building and deploying to Cloud Run.
+
+- `@mention` the bot in a Slack channel to perform Salesforce operations
+- CRUD operations on standard objects: Account, Contact, Opportunity, Lead, Case
+- SOQL query-based data search and retrieval
+- Maintains conversation context within Slack threads
+- Multimodal input support: text, images, PDFs, video, and audio
+- Access control to restrict bot usage to specific Slack members
+- Rich text output with Slack-compatible Markdown
+
+## Architecture
+
+```
+Slack → FastAPI (/slack/events) → ADK Root Agent
+                                    ├── McpToolset (stdio) → Salesforce MCP Server
+                                    │       ├── salesforce_query (SOQL execution)
+                                    │       ├── salesforce_describe (object metadata)
+                                    │       ├── salesforce_create_record (create)
+                                    │       ├── salesforce_update_record (update)
+                                    │       └── salesforce_delete_record (delete)
+                                    ├── get_current_datetime (datetime utility)
+                                    ├── web_search_agent (Google Search)
+                                    ├── url_fetch_agent (URL content retrieval)
+                                    └── salesforce_agent (Salesforce sub-agent)
+```
 
 ## Project Structure
+
 ```
 app/
-  main.py           # FastAPI app and Slack Bolt handlers
+  main.py                    # FastAPI app, Slack Bolt handlers, root agent, access control
+  __init__.py                # root_agent export (entry point for `adk web`)
   agents/
-    comedian.py     # ex: Comedian agent implementation
+    salesforce_agent.py      # Salesforce CRUD sub-agent
+    web_search_agent.py      # Web search and URL fetch agents
   tools/
-    get_current_datetime.py  # ex: Date/time utility tool
+    get_current_datetime.py  # Datetime utility tool
+mcp_servers/
+  salesforce_server.py       # FastMCP server wrapping Salesforce REST API
 scripts/
-  deploy.sh         # Helper script to deploy to Cloud Run
-Dockerfile          # Container definition for Cloud Run
-requirements.txt    # Python dependencies
-llms.txt           # ADK documentation for LLM reference
-llms-full.txt      # Extended ADK documentation for LLM context
+  deploy.sh                  # Cloud Run deployment script
+Dockerfile                   # Container definition
+requirements.txt             # Python dependencies
 ```
 
 ## Prerequisites
+
 - Python 3.13
-- [Google Cloud SDK](https://cloud.google.com/sdk) with `gcloud` authenticated
-- Slack workspace admin privileges
+- [Google Cloud SDK](https://cloud.google.com/sdk) (`gcloud` authenticated)
+- A Slack workspace where you can install apps
+- Salesforce Connected App (client_credentials grant)
 
 ## Local Development
+
 1. Install dependencies
    ```bash
    python -m venv venv
    source venv/bin/activate
    pip install -r requirements.txt
    ```
+
 2. Configure environment variables
    ```bash
    cp .env.example .env
-   # edit .env and set your Slack and Google Cloud credentials
-   # ALLOWED_SLACK_WORKSPACE is the Slack team ID to allow requests from
    ```
-3. Run the server
+   Edit `.env` and set the following:
+   - `SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` — Slack Bot credentials
+   - `SF_CLIENT_ID` / `SF_CLIENT_SECRET` — Salesforce Connected App credentials
+   - `SF_LOGIN_URL` — Your Salesforce instance URL (default: `https://login.salesforce.com`)
+   - `ALLOWED_SLACK_USERS` — Comma-separated Slack user IDs to allow (empty = allow all)
+
+3. Start the server
    ```bash
    uvicorn app.main:fastapi_app --host 0.0.0.0 --port 8080 --reload
    ```
+
 4. Use a tunneling tool like `ngrok` to expose `http://localhost:8080/slack/events` to Slack during development.
 
-### Optional: Use the ADK Web Development UI
+### ADK Web Development UI
 
-The Agent Development Kit includes a built-in web-based Development UI that you can run locally. It's a powerful tool for testing, debugging, and interacting with your agent during development. It provides a chat interface to send messages to your agent and inspect the results.
+You can test and debug agents using the ADK Web UI.
 
-1.  **Start the ADK web server:**
-    ```bash
-    gcloud auth application-default login
-    adk web
-    ```
+```bash
+gcloud auth application-default login
+adk web
+```
 
-2.  **Interact with your agent:**
-    Open the local URL (usually `http://127.0.0.1:8000`) in your browser to use the Development UI.
+Open `http://127.0.0.1:8000` in your browser to interact with the agents.
 
-## Slack App Configuration
+## Slack App Setup
+
 1. Create a new Slack app at <https://api.slack.com/apps>.
-2. Under **OAuth & Permissions**, add the following Bot Token scopes:
+2. Under **OAuth & Permissions**, add these Bot Token Scopes:
    - `app_mentions:read`
    - `chat:write`
    - `channels:history`
@@ -83,28 +106,83 @@ The Agent Development Kit includes a built-in web-based Development UI that you 
    - `files:read`
    - `reactions:write`
    - `users:read`
-3. Install the app to your workspace to obtain `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`.
-4. Enable **Event Subscriptions** and set the Request URL to `https://<your-cloud-run-service-url>/slack/events`.
-5. Subscribe to bot events: `app_mention`.
-6. Invite the bot to channels where you want to use it.
+3. Install the app to your workspace and obtain the `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`.
+4. Enable **Event Subscriptions** and set the Request URL to `https://<your-cloud-run-url>/slack/events`.
+5. Subscribe to the following bot events:
+   - `app_mention` — Respond to @mentions in channels
+   - `message.im` — Respond to direct messages
+6. Invite the bot to the channels where you want to use it.
+
+## Getting Slack User IDs
+
+To configure `ALLOWED_SLACK_USERS`, you need Slack user IDs:
+
+### Option 1: From the Slack App
+
+1. Open the target user's profile (click their name)
+2. Click the **⋮** (more actions) menu
+3. Select **"Copy member ID"**
+
+### Option 2: Via Slack API
+
+```bash
+curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  "https://slack.com/api/users.list" | jq '.members[] | {id, name, real_name: .profile.real_name}'
+```
+
+User IDs start with `U` followed by alphanumeric characters (e.g., `U01AB2CD3EF`). Separate multiple IDs with commas:
+
+```
+ALLOWED_SLACK_USERS=U01AB2CD3EF,U04XY5ZW6GH
+```
+
+## Salesforce Connected App Setup
+
+1. In Salesforce, go to **Setup** → **App Manager** → **New Connected App**
+2. Enable **OAuth Settings** and configure:
+   - Callback URL: `https://login.salesforce.com/services/oauth2/callback`
+   - OAuth Scopes: `Manage user data via APIs (api)`, `Perform requests at any time (refresh_token, offline_access)`
+3. Enable **Client Credentials Flow** and assign a run-as user
+4. Set `SF_CLIENT_ID` (Consumer Key) and `SF_CLIENT_SECRET` (Consumer Secret) in your `.env` file
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SLACK_BOT_TOKEN` | Yes | Slack Bot User OAuth token |
+| `SLACK_SIGNING_SECRET` | Yes | Slack app signing secret |
+| `SF_CLIENT_ID` | Yes | Salesforce Connected App consumer key |
+| `SF_CLIENT_SECRET` | Yes | Salesforce Connected App consumer secret |
+| `SF_LOGIN_URL` | No | Salesforce login URL (default: `https://login.salesforce.com`) |
+| `SF_API_VERSION` | No | Salesforce API version (default: `v66.0`) |
+| `MODEL_NAME` | No | Gemini model name (default: `gemini-3.1-flash-lite-preview`) |
+| `ALLOWED_SLACK_WORKSPACE` | No | Slack Team ID to restrict requests to |
+| `ALLOWED_SLACK_USERS` | No | Comma-separated Slack user IDs allowed to use the bot |
+| `GOOGLE_GENAI_USE_VERTEXAI` | No | Set to `TRUE` to use Vertex AI |
+| `GOOGLE_CLOUD_PROJECT` | No | Google Cloud project ID |
+| `APP_NAME` | No | ADK application name (default: `salesforce-agent`) |
+| `REACTION_PROCESSING` | No | Slack emoji for processing indicator (default: `eyes`) |
+| `REACTION_COMPLETED` | No | Slack emoji for completion indicator (default: `white_check_mark`) |
 
 ## Deploy to Cloud Run
-The repository includes a helper script to build the container and deploy to Cloud Run. Ensure your `.env` contains `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET` before running:
 
-### One-time setup (first run only)
-Enable the Cloud Build API for your project:
+Ensure the required environment variables are set in `.env` before deploying.
+
+### First-Time Setup (one-time only)
+
 ```bash
 gcloud services enable cloudbuild.googleapis.com
 ```
 
-Then deploy:
+### Deploy
+
 ```bash
 ./scripts/deploy.sh
 ```
 
 The script will:
-1. Build the container image using Cloud Build.
-2. Deploy the image to Cloud Run.
-3. Set the required environment variables on the service.
+1. Build the container image using Cloud Build
+2. Deploy to Cloud Run with all environment variables
+3. Display the service URL
 
-After deployment, configure the Slack app's event subscription URL to the Cloud Run service URL.
+After deployment, set the Cloud Run service URL (`https://<service-url>/slack/events`) as the Event Subscriptions Request URL in your Slack app configuration.

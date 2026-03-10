@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sys
 import uuid
 from typing import List
 
@@ -14,9 +15,13 @@ from google.genai import types
 from google.adk.agents import Agent
 from google.adk.events.event import Event
 from google.adk.runners import InMemoryRunner
-# from google.adk.tools import google_search
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.tools.agent_tool import AgentTool
+from mcp import StdioServerParameters
 
-from .agents.comedian import comedian_agent
+from .agents.salesforce_agent import create_salesforce_agent
+from .agents.web_search_agent import web_search_agent, url_fetch_agent
 from .tools.get_current_datetime import get_current_datetime
 
 # Environment variables
@@ -25,9 +30,15 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-3.1-pro-preview")
 ALLOWED_SLACK_WORKSPACE = os.environ.get("ALLOWED_SLACK_WORKSPACE")
-APP_NAME = os.environ.get("APP_NAME", "slack-bot")
+ALLOWED_SLACK_USERS = os.environ.get("ALLOWED_SLACK_USERS", "")
+APP_NAME = os.environ.get("APP_NAME", "salesforce-agent")
 REACTION_PROCESSING = os.environ.get("REACTION_PROCESSING", "eyes")
 REACTION_COMPLETED = os.environ.get("REACTION_COMPLETED", "white_check_mark")
+
+# Parse allowed user IDs (comma-separated)
+_allowed_user_ids: set[str] = {
+    uid.strip() for uid in ALLOWED_SLACK_USERS.split(",") if uid.strip()
+}
 
 # Initialize Slack Bolt AsyncApp
 bolt_app = AsyncApp(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
@@ -39,6 +50,20 @@ fastapi_app = FastAPI()
 _user_name_cache: dict[str, str] = {}
 # Bot's own user ID (resolved once at first mention)
 _bot_user_id: str | None = None
+
+# MCP Toolset for Salesforce — assigned to salesforce_agent
+_salesforce_mcp = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "mcp_servers.salesforce_server"],
+            env={**os.environ},
+        ),
+        timeout=30.0,
+    ),
+)
+
+salesforce_agent = create_salesforce_agent(tools=[_salesforce_mcp])
 
 
 async def _resolve_user_name(client, user_id: str) -> str:
@@ -145,33 +170,42 @@ async def _populate_session_from_thread(
 
 
 root_agent = Agent(
-    name="slack_bot_agent",
+    name="salesforce_slack_bot",
     model=MODEL_NAME,
-    instruction="""
-You are acting as a Slack Bot. All your responses must be formatted using Slack-compatible Markdown.
+    generate_content_config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(
+            thinking_level="HIGH",
+        )
+    ),
+    instruction="""\
+You are a Slack Bot that assists with Salesforce data operations.
+Delegate all Salesforce operations to the sub-agent (salesforce_agent).
+Use web_search_agent or url_fetch_agent only when company information lookup is needed during Salesforce operations (e.g., when registering a new Account).
+Do not handle general questions unrelated to Salesforce. Inform the user that this bot is dedicated to Salesforce operations.
+
+## Slack Behavior Rules
 
 ### Speaker Identification
-- Each user message begins with a `[Speaker: <name>]` tag identifying who sent it.
-- Your own previous responses (model messages) do NOT have a speaker tag — those are yours.
-- When summarizing discussions, attributing opinions, or referring to what someone said,
-  always use the speaker's name (e.g., "Tanaka said …", "Suzuki suggested …").
-- If asked to summarize a thread, list each person's key points by name.
-- Do NOT include the `[Speaker: ...]` tag in your replies.
+- User messages include a `[Speaker: <name>]` tag. Distinguish who said what when responding
+- Your own past responses do not have this tag
+- Use speaker names when summarizing or quoting (e.g., "As John mentioned...")
+- Do not include `[Speaker: ...]` tags in your responses
 
-### Formatting Rules
-- **Headings / emphasis**: Use `*bold*` for section titles or important words.
-- *Italics*: Use `_underscores_` for emphasis when needed.
-- Lists: Use `-` for unordered lists, and `1.` for ordered lists.
-- Code snippets: Use triple backticks (```) for multi-line code blocks, and backticks (`) for inline code.
-- Links: Use `<https://example.com|display text>` format.
-- Blockquotes: Use `>` at the beginning of a line.
+### Formatting
+- Write all responses in Slack-compatible Markdown (mrkdwn)
+- Bold: `*bold*`, Italic: `_italic_`, Lists: `-` / `1.`
+- Code: backticks, Links: `<URL|display text>`, Blockquote: `>`
 
-Always structure your response clearly, using these rules so it renders correctly in Slack.""",
+### Date/Time Handling
+- When the user references relative time periods (e.g., "this month", "last quarter", "past 3 months"), always use the get_current_datetime tool to get the current date/time first
+""",
     tools=[
         get_current_datetime,
+        AgentTool(agent=web_search_agent),
+        AgentTool(agent=url_fetch_agent),
     ],
     sub_agents=[
-        comedian_agent,
+        salesforce_agent,
     ],
 )
 
@@ -190,39 +224,56 @@ def _build_slack_blocks_from_text(text: str) -> List[dict]:
     ] or [{"type": "section", "text": {"type": "mrkdwn", "text": ""}}]
 
 
-@bolt_app.event("app_mention")
-async def handle_mention(body, say, client, logger, ack):
-    # Ack as soon as possible to avoid Slack retries that can cause duplicated responses
-    await ack()
-
-    event = body["event"]
+async def _handle_message(event, say, client, logger):
+    """Core message handler shared by app_mention and DM events."""
     channel = event["channel"]
     message_ts = event["ts"]
     thread_ts = event.get("thread_ts") or message_ts
     user_id = event.get("user", "unknown")
 
-    # Add 👀 reaction to indicate the message is being processed
+    # Member restriction: only respond to allowed users
+    if _allowed_user_ids and user_id not in _allowed_user_ids:
+        await say(
+            text="Sorry, you do not have permission to use this bot.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # Add 👀 reaction to indicate processing
     try:
-        await client.reactions_add(channel=channel, timestamp=message_ts, name=REACTION_PROCESSING)
+        await client.reactions_add(
+            channel=channel,
+            timestamp=message_ts,
+            name=REACTION_PROCESSING,
+        )
     except Exception:
         pass
 
     user_content = await _build_content_from_event(event)
 
-    # Prepend speaker identification to the current message
+    # Prepend speaker identification
     speaker_name = await _resolve_user_name(client, user_id)
-    speaker_prefix = types.Part.from_text(text=f"[Speaker: {speaker_name}]")
-    user_content = types.Content(role="user", parts=[speaker_prefix] + list(user_content.parts))
+    speaker_prefix = types.Part.from_text(
+        text=f"[Speaker: {speaker_name}]"
+    )
+    user_content = types.Content(
+        role="user",
+        parts=[speaker_prefix] + list(user_content.parts),
+    )
 
     try:
         await session_service.create_session(
-            app_name=APP_NAME, user_id=user_id, session_id=thread_ts
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=thread_ts,
         )
     except Exception:
         pass
 
     session = await session_service.get_session(
-        app_name=APP_NAME, user_id=user_id, session_id=thread_ts
+        app_name=APP_NAME,
+        user_id=user_id,
+        session_id=thread_ts,
     )
     if session and not session.events:
         await _populate_session_from_thread(
@@ -236,7 +287,9 @@ async def handle_mention(body, say, client, logger, ack):
     try:
         reply_text = ""
         async for ev in runner.run_async(
-            user_id=user_id, session_id=thread_ts, new_message=user_content
+            user_id=user_id,
+            session_id=thread_ts,
+            new_message=user_content,
         ):
             if ev.is_final_response():
                 reply_text = ev.content.parts[0].text.strip()
@@ -254,11 +307,34 @@ async def handle_mention(body, say, client, logger, ack):
         thread_ts=thread_ts,
     )
 
-    # Add ✅ reaction to indicate the reply is complete
+    # Add ✅ reaction to indicate completion
     try:
-        await client.reactions_add(channel=channel, timestamp=message_ts, name=REACTION_COMPLETED)
+        await client.reactions_add(
+            channel=channel,
+            timestamp=message_ts,
+            name=REACTION_COMPLETED,
+        )
     except Exception:
         pass
+
+
+@bolt_app.event("app_mention")
+async def handle_mention(body, say, client, logger, ack):
+    await ack()
+    await _handle_message(body["event"], say, client, logger)
+
+
+@bolt_app.event("message")
+async def handle_dm(body, say, client, logger, ack):
+    await ack()
+    event = body["event"]
+    # Only respond to DMs (channel_type: im), ignore other messages
+    if event.get("channel_type") != "im":
+        return
+    # Ignore bot's own messages to prevent loops
+    if event.get("bot_id") or event.get("user") == _bot_user_id:
+        return
+    await _handle_message(event, say, client, logger)
 
 
 @fastapi_app.post("/slack/events")
